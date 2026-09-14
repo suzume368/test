@@ -1,0 +1,38 @@
+name: SpinPK Auto Bot
+
+on:
+  schedule:
+    # Runs every 5 hours (safely after 4h 50m cooldown)
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
+
+jobs:
+  spin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run SpinPK Bot
+        env:
+          SPINPK_TOKENS: ${{ secrets.SPINPK_TOKENS }}
+          SPINPK_DEVICE_ID: ${{ secrets.SPINPK_DEVICE_ID }}
+        run: python spinpk_bot.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spinpk-results-${{ github.run_number }}
+          path: '*.json'
+          retention-days: 7

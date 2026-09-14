@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SpinPK Auto Bot - GitHub Actions Edition
-Cooldown: 4h 50m (17400 sec) between spins per token
+Uses server's wait_sec to compute exact next spin time
 """
 
 import requests
@@ -9,7 +9,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # ==================== CONFIG ====================
 DEVICE_ID = os.environ.get("SPINPK_DEVICE_ID", "f607b24295e557fe")
@@ -26,8 +26,7 @@ AUTH_URL = f"{BASE_URL}/auth.php"
 HEARTBEAT_URL = f"{BASE_URL}/me.php"
 SPIN_URL = f"{BASE_URL}/spin.php"
 
-# Cooldown: 4h 50m = 17400 sec
-SPIN_INTERVAL_SEC = 17400
+DEFAULT_COOLDOWN = 17400  # 4h 50m fallback
 
 # ==================== HEADERS ====================
 def get_headers(token):
@@ -57,6 +56,20 @@ def p_info(m): print(f" ℹ️  {m}", flush=True)
 def p_warning(m): print(f" ⚠️  {m}", flush=True)
 
 def short(t): return f"{t[:8]}...{t[-6:]}"
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+def fmt_utc(dt):
+    return dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+
+def fmt_pkt(dt):
+    pkt = dt.astimezone(timezone(timedelta(hours=5)))
+    return pkt.strftime('%Y-%m-%d %H:%M:%S PKT')
+
+def next_spin_str(wait_sec):
+    dt = utc_now() + timedelta(seconds=wait_sec)
+    return fmt_utc(dt), fmt_pkt(dt)
 
 # ==================== API ====================
 def check_token(token):
@@ -88,10 +101,14 @@ def spin(token):
         r = requests.post(SPIN_URL, headers=get_headers(token), json={"action": "play"}, timeout=30)
         if r.status_code == 200:
             data = r.json()
-            print(f"   🔍 RAW: {json.dumps(data)[:500]}", flush=True)
+            if not data.get('ok'):
+                wait = data.get('wait_sec', 0)
+                print(f"   ⏳ Not ready. Wait: {wait}s ({wait//60}m {wait%60}s)", flush=True)
+                return None
             return data
         return None
-    except:
+    except Exception as e:
+        print(f"   ❌ spin exception: {e}", flush=True)
         return None
 
 # ==================== HELPERS ====================
@@ -110,9 +127,6 @@ def save_json(name, data):
     except:
         pass
 
-def next_spin_time():
-    return (datetime.utcnow() + timedelta(seconds=SPIN_INTERVAL_SEC)).strftime('%Y-%m-%d %H:%M:%S UTC')
-
 def get_balance(result):
     try:
         return float(result['user'].get('balance', 0))
@@ -127,7 +141,8 @@ def run_token(token, index, total):
 
     result = {
         "token": short(token), "auth": False, "spin": False,
-        "balance": "N/A", "next_spin": None, "won": 0
+        "balance": "N/A", "next_spin_utc": "-", "next_spin_pkt": "-",
+        "won": 0, "big": False
     }
 
     if not check_token(token):
@@ -149,45 +164,52 @@ def run_token(token, index, total):
     res = spin(token)
     if res:
         result["spin"] = True
+        amount = res.get('amount', 0)
+        big = res.get('big', False)
+        new_balance = res.get('balance', 'N/A')
+        wait_sec = res.get('wait_sec', DEFAULT_COOLDOWN)
 
-        # Try to extract reward fields from multiple possible keys
-        data = res.get('data', res) if isinstance(res, dict) else {}
-        coins = data.get('coins', data.get('reward', data.get('amount', data.get('points', '?'))))
-        prize = data.get('prize', data.get('prize_name', data.get('reward_name', '?')))
-        msg = data.get('message', data.get('msg', ''))
-        print(f"   🎰 Spin OK: coins={coins} prize={prize} msg={msg}", flush=True)
+        result["won"] = amount
+        result["balance"] = new_balance
+        result["big"] = big
 
-        time.sleep(2)
-        final = auth_me(token)
-        bal_after = bal_before
-        if final and 'user' in final:
-            bal_after = get_balance(final)
-            result["balance"] = final['user'].get('balance', 'N/A')
-            save_json(f"final_{index}.json", final)
+        big_str = " 🎉 BIG WIN!" if big else ""
+        print(f"   🎰 Won: {amount} PKR{big_str}", flush=True)
+        print(f"   💰 Balance: {bal_before} → {new_balance} PKR", flush=True)
 
-        won = round(bal_after - bal_before, 2)
-        result["won"] = won
-        print(f"   💰 Balance: {bal_before} → {bal_after} | Won: {won} PKR", flush=True)
+        nxt_utc, nxt_pkt = next_spin_str(wait_sec)
+        result["next_spin_utc"] = nxt_utc
+        result["next_spin_pkt"] = nxt_pkt
+        print(f"   ⏭️  Next spin (UTC): {nxt_utc}", flush=True)
+        print(f"   ⏭️  Next spin (PKT): {nxt_pkt}", flush=True)
+        print(f"   ⏳ Cooldown: {wait_sec}s ({wait_sec//3600}h {(wait_sec%3600)//60}m)", flush=True)
 
-        result["next_spin"] = next_spin_time()
-        print(f"   ⏭️  Next spin available at: {result['next_spin']}", flush=True)
-        print(f"   ⏳ Cooldown: 4h 50m ({SPIN_INTERVAL_SEC} sec)", flush=True)
+        history = res.get('history', [])[:3]
+        if history:
+            print(f"   📜 Recent history:", flush=True)
+            for h in history:
+                ts = datetime.fromtimestamp(h.get('ts', 0), tz=timezone.utc)
+                print(f"      {fmt_pkt(ts)} | +{h.get('amount',0)} PKR | {h.get('note','')}", flush=True)
+
+        save_json(f"spin_{index}.json", res)
     else:
-        p_warning("Spin failed or on cooldown")
+        result["next_spin_utc"] = "cooldown"
+        result["next_spin_pkt"] = "cooldown"
+        p_warning("Spin not ready or failed")
 
     p_success(f"Done {short(token)} | Balance: {result['balance']} PKR | Won: {result['won']}")
     return result
 
 # ==================== MAIN ====================
 def main():
-    start = datetime.utcnow()
+    start = utc_now()
     print("\n" + "=" * 60, flush=True)
     print(" 🎰 SPINPK AUTO BOT - GitHub Actions", flush=True)
     print("=" * 60, flush=True)
     print(f" 📱 Tokens: {len(TOKENS)}", flush=True)
     print(f" 📱 Device ID: {DEVICE_ID}", flush=True)
-    print(f" ⏱️  Cooldown: 4h 50m ({SPIN_INTERVAL_SEC} sec)", flush=True)
-    print(f" 🚀 Started: {start.strftime('%Y-%m-%d %H:%M:%S UTC')}", flush=True)
+    print(f" 🚀 Started (UTC): {fmt_utc(start)}", flush=True)
+    print(f" 🚀 Started (PKT): {fmt_pkt(start)}", flush=True)
     print("=" * 60, flush=True)
 
     results = []
@@ -196,7 +218,9 @@ def main():
             results.append(run_token(tok, i, len(TOKENS)))
         except Exception as e:
             p_error(f"Exception token {i}: {e}")
-            results.append({"token": short(tok), "auth": False, "spin": False, "balance": "N/A", "next_spin": None, "won": 0})
+            results.append({"token": short(tok), "auth": False, "spin": False,
+                            "balance": "N/A", "next_spin_utc": "-", "next_spin_pkt": "-",
+                            "won": 0, "big": False})
 
     print("\n" + "=" * 60, flush=True)
     print(" 📊 FINAL SUMMARY", flush=True)
@@ -204,16 +228,17 @@ def main():
     ok_spins = 0
     total_won = 0
     for r in results:
-        s = "✅" if r["spin"] else ("⚠️" if r["auth"] else "❌")
-        print(f" {s} {r['token']} | Bal: {r['balance']} PKR | Won: {r.get('won',0)} | Next: {r['next_spin']}", flush=True)
+        s = "✅" if r["spin"] else ("⏳" if r["auth"] else "❌")
+        print(f" {s} {r['token']} | Bal: {r['balance']} PKR | Won: {r.get('won',0)}", flush=True)
+        print(f"     ⏭️  Next (UTC): {r['next_spin_utc']}", flush=True)
+        print(f"     ⏭️  Next (PKT): {r['next_spin_pkt']}", flush=True)
         if r["spin"]: ok_spins += 1
         total_won += r.get("won", 0)
-    dur = (datetime.utcnow() - start).total_seconds()
+    dur = (utc_now() - start).total_seconds()
     print("-" * 60, flush=True)
     print(f" 🎰 Successful spins: {ok_spins}/{len(results)}", flush=True)
-    print(f" 💰 Total won this run: {round(total_won, 2)} PKR", flush=True)
+    print(f" 💰 Total won this run: {total_won} PKR", flush=True)
     print(f" ⏱️  Duration: {dur:.2f}s", flush=True)
-    print(f" ⏭️  Next run in ~5h (cron '0 */5 * * *')", flush=True)
     print("=" * 60, flush=True)
     p_success("ALL DONE")
 

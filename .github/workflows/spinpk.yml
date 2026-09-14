@@ -2,8 +2,7 @@ name: SpinPK Auto Bot
 
 on:
   schedule:
-    # Runs every 5 hours (safely after 4h 50m cooldown)
-    - cron: '0 */5 * * *'
+    - cron: '30 */5 * * *'   # har 5h ke 30th min pe (UTC)
   workflow_dispatch:
 
 jobs:

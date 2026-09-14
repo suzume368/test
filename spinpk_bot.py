@@ -17,10 +17,6 @@ TOKENS_ENV = os.environ.get("SPINPK_TOKENS", "")
 
 DEFAULT_TOKENS = [
     "1f5587940e9546229e1c1426cea08f9a88e89a48db6f018d04420a5e0e6e04db",
-    "e769d7bbd9248e64e43f3331f5d49306b4d998d75919d90871ba76746a244409",
-    "5b83c211940a0df1b36a78ba341b8f0b596847c40331f28e12378677296e31fa",
-    "10768a197a98f8137172d7fcb8de19b4022bb3b70abe554ed36ccc96eb6ed550",
-    "64d7a52e79dc3c8512e7dac79dbbd8d6f9db7ce91a8ea7c593ad8437d76971c8",
 ]
 
 TOKENS = [t.strip() for t in TOKENS_ENV.split(",") if t.strip()] or DEFAULT_TOKENS
@@ -32,8 +28,6 @@ SPIN_URL = f"{BASE_URL}/spin.php"
 
 # Cooldown: 4h 50m = 17400 sec
 SPIN_INTERVAL_SEC = 17400
-# GitHub Action cron runs every 5h; we only do ONE spin per token per run
-# because next spin needs 4h50m cooldown.
 
 # ==================== HEADERS ====================
 def get_headers(token):
@@ -92,7 +86,11 @@ def heartbeat(token):
 def spin(token):
     try:
         r = requests.post(SPIN_URL, headers=get_headers(token), json={"action": "play"}, timeout=30)
-        return r.json() if r.status_code == 200 else None
+        if r.status_code == 200:
+            data = r.json()
+            print(f"   🔍 RAW: {json.dumps(data)[:500]}", flush=True)
+            return data
+        return None
     except:
         return None
 
@@ -115,13 +113,22 @@ def save_json(name, data):
 def next_spin_time():
     return (datetime.utcnow() + timedelta(seconds=SPIN_INTERVAL_SEC)).strftime('%Y-%m-%d %H:%M:%S UTC')
 
+def get_balance(result):
+    try:
+        return float(result['user'].get('balance', 0))
+    except:
+        return 0.0
+
 # ==================== PER-TOKEN ====================
 def run_token(token, index, total):
     print("\n" + "=" * 60, flush=True)
     print(f" 🎯 TOKEN {index}/{total}: {short(token)}", flush=True)
     print("=" * 60, flush=True)
 
-    result = {"token": short(token), "auth": False, "spin": False, "balance": "N/A", "next_spin": None}
+    result = {
+        "token": short(token), "auth": False, "spin": False,
+        "balance": "N/A", "next_spin": None, "won": 0
+    }
 
     if not check_token(token):
         p_error(f"Token invalid/expired: {short(token)}")
@@ -135,31 +142,40 @@ def run_token(token, index, total):
         save_json(f"auth_{index}.json", auth)
         show_user(auth, token)
 
+    bal_before = get_balance(auth) if auth else 0.0
+
     heartbeat(token)
 
-    # Single spin only (GitHub Actions runs every 5h)
     res = spin(token)
     if res:
         result["spin"] = True
-        data = res.get('data', {})
-        coins = data.get('coins', '?')
-        prize = data.get('prize', '?')
-        msg = data.get('message', '')
+
+        # Try to extract reward fields from multiple possible keys
+        data = res.get('data', res) if isinstance(res, dict) else {}
+        coins = data.get('coins', data.get('reward', data.get('amount', data.get('points', '?'))))
+        prize = data.get('prize', data.get('prize_name', data.get('reward_name', '?')))
+        msg = data.get('message', data.get('msg', ''))
         print(f"   🎰 Spin OK: coins={coins} prize={prize} msg={msg}", flush=True)
 
-        # Compute next spin time
+        time.sleep(2)
+        final = auth_me(token)
+        bal_after = bal_before
+        if final and 'user' in final:
+            bal_after = get_balance(final)
+            result["balance"] = final['user'].get('balance', 'N/A')
+            save_json(f"final_{index}.json", final)
+
+        won = round(bal_after - bal_before, 2)
+        result["won"] = won
+        print(f"   💰 Balance: {bal_before} → {bal_after} | Won: {won} PKR", flush=True)
+
         result["next_spin"] = next_spin_time()
         print(f"   ⏭️  Next spin available at: {result['next_spin']}", flush=True)
         print(f"   ⏳ Cooldown: 4h 50m ({SPIN_INTERVAL_SEC} sec)", flush=True)
     else:
         p_warning("Spin failed or on cooldown")
 
-    final = auth_me(token)
-    if final and 'user' in final:
-        result["balance"] = final['user'].get('balance', 'N/A')
-        save_json(f"final_{index}.json", final)
-
-    p_success(f"Done {short(token)} | Balance: {result['balance']} PKR")
+    p_success(f"Done {short(token)} | Balance: {result['balance']} PKR | Won: {result['won']}")
     return result
 
 # ==================== MAIN ====================
@@ -180,19 +196,22 @@ def main():
             results.append(run_token(tok, i, len(TOKENS)))
         except Exception as e:
             p_error(f"Exception token {i}: {e}")
-            results.append({"token": short(tok), "auth": False, "spin": False, "balance": "N/A", "next_spin": None})
+            results.append({"token": short(tok), "auth": False, "spin": False, "balance": "N/A", "next_spin": None, "won": 0})
 
     print("\n" + "=" * 60, flush=True)
     print(" 📊 FINAL SUMMARY", flush=True)
     print("=" * 60, flush=True)
     ok_spins = 0
+    total_won = 0
     for r in results:
         s = "✅" if r["spin"] else ("⚠️" if r["auth"] else "❌")
-        print(f" {s} {r['token']} | Balance: {r['balance']} PKR | Next: {r['next_spin']}", flush=True)
+        print(f" {s} {r['token']} | Bal: {r['balance']} PKR | Won: {r.get('won',0)} | Next: {r['next_spin']}", flush=True)
         if r["spin"]: ok_spins += 1
+        total_won += r.get("won", 0)
     dur = (datetime.utcnow() - start).total_seconds()
     print("-" * 60, flush=True)
     print(f" 🎰 Successful spins: {ok_spins}/{len(results)}", flush=True)
+    print(f" 💰 Total won this run: {round(total_won, 2)} PKR", flush=True)
     print(f" ⏱️  Duration: {dur:.2f}s", flush=True)
     print(f" ⏭️  Next run in ~5h (cron '0 */5 * * *')", flush=True)
     print("=" * 60, flush=True)
